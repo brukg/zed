@@ -573,6 +573,12 @@ pub struct GitPanelSettingsContent {
     /// Default: false
     pub sort_by_path: Option<bool>,
 
+    /// Whether to group entries by staging status,
+    /// showing "Staged Changes" and "Changes" sections.
+    ///
+    /// Default: true
+    pub group_by_staging: Option<bool>,
+
     /// Whether to collapse untracked files in the diff panel.
     ///
     /// Default: false

@@ -930,6 +930,11 @@
     //
     // Default: false
     "sort_by_path": false,
+    // Whether to group entries by staging status,
+    // showing "Staged Changes" and "Changes" sections.
+    //
+    // Default: true
+    "group_by_staging": true,
     // Whether to collapse untracked files in the diff panel.
     //
     // Default: false
