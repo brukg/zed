@@ -70,8 +70,8 @@ use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
 use ui::{
     ButtonLike, Checkbox, CommonAnimationExt, ContextMenu, ElevationIndex, IndentGuideColors,
-    PopoverMenu, RenderedIndentGuide, ScrollAxes, Scrollbars, SplitButton, Tooltip, WithScrollbar,
-    prelude::*,
+    ListHeader, PopoverMenu, RenderedIndentGuide, ScrollAxes, Scrollbars, SplitButton, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::paths::PathStyle;
 use util::{ResultExt, TryFutureExt, maybe, rel_path::RelPath};
@@ -266,6 +266,21 @@ struct SerializedGitPanel {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+enum StagingGroup {
+    Staged,
+    Unstaged,
+}
+
+impl StagingGroup {
+    fn title(&self) -> &'static str {
+        match self {
+            StagingGroup::Staged => "Staged Changes",
+            StagingGroup::Unstaged => "Changes",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 enum Section {
     Conflict,
     Tracked,
@@ -300,6 +315,7 @@ impl GitHeaderEntry {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum GitListEntry {
+    StagingGroupHeader(StagingGroup),
     Status(GitStatusEntry),
     TreeStatus(GitTreeStatusEntry),
     Directory(GitTreeDirEntry),
@@ -311,7 +327,7 @@ impl GitListEntry {
         match self {
             GitListEntry::Status(entry) => Some(entry),
             GitListEntry::TreeStatus(entry) => Some(&entry.entry),
-            _ => None,
+            GitListEntry::StagingGroupHeader(_) | GitListEntry::Directory(_) | GitListEntry::Header(_) => None,
         }
     }
 
@@ -327,7 +343,7 @@ impl GitListEntry {
         match self {
             GitListEntry::Directory(dir) => dir.depth,
             GitListEntry::TreeStatus(status) => status.depth,
-            _ => 0,
+            GitListEntry::StagingGroupHeader(_) | GitListEntry::Status(_) | GitListEntry::Header(_) => 0,
         }
     }
 }
@@ -653,6 +669,9 @@ pub struct GitPanel {
     local_committer_task: Option<Task<()>>,
     bulk_staging: Option<BulkStaging>,
     stash_entries: GitStash,
+    collapsed_staging_groups: HashSet<StagingGroup>,
+    staged_group_count: usize,
+    unstaged_group_count: usize,
 
     _settings_subscription: Subscription,
 }
@@ -717,6 +736,7 @@ impl GitPanel {
             let mut was_file_icons = GitPanelSettings::get_global(cx).file_icons;
             let mut was_folder_icons = GitPanelSettings::get_global(cx).folder_icons;
             let mut was_diff_stats = GitPanelSettings::get_global(cx).diff_stats;
+            let mut was_group_by_staging = GitPanelSettings::get_global(cx).group_by_staging;
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let settings = GitPanelSettings::get_global(cx);
                 let sort_by_path = settings.sort_by_path;
@@ -724,12 +744,16 @@ impl GitPanel {
                 let file_icons = settings.file_icons;
                 let folder_icons = settings.folder_icons;
                 let diff_stats = settings.diff_stats;
+                let group_by_staging = settings.group_by_staging;
                 if tree_view != was_tree_view {
                     this.view_mode = GitPanelViewMode::from_settings(cx);
                 }
 
                 let mut update_entries = false;
-                if sort_by_path != was_sort_by_path || tree_view != was_tree_view {
+                if sort_by_path != was_sort_by_path
+                    || tree_view != was_tree_view
+                    || group_by_staging != was_group_by_staging
+                {
                     this.bulk_staging.take();
                     update_entries = true;
                 }
@@ -744,6 +768,7 @@ impl GitPanel {
                 was_file_icons = file_icons;
                 was_folder_icons = folder_icons;
                 was_diff_stats = diff_stats;
+                was_group_by_staging = group_by_staging;
             })
             .detach();
 
@@ -840,6 +865,9 @@ impl GitPanel {
                 entry_count: 0,
                 bulk_staging: None,
                 stash_entries: Default::default(),
+                collapsed_staging_groups: HashSet::default(),
+                staged_group_count: 0,
+                unstaged_group_count: 0,
                 _settings_subscription,
             };
 
@@ -1944,6 +1972,24 @@ impl GitPanel {
                         })
                         .collect::<Vec<_>>();
                     (goal_stage, entries)
+                }
+                GitListEntry::StagingGroupHeader(group) => {
+                    let stage = matches!(group, StagingGroup::Unstaged);
+                    let entries = self
+                        .entries
+                        .iter()
+                        .filter_map(|entry| entry.status_entry())
+                        .filter(|status_entry| {
+                            let status = GitPanel::stage_status_for_entry(status_entry, &repo);
+                            if stage {
+                                status.has_unstaged()
+                            } else {
+                                status.has_staged()
+                            }
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    (stage, entries)
                 }
             }
         };
@@ -3523,13 +3569,18 @@ impl GitPanel {
         self.entry_count = 0;
         self.max_width_item_index = None;
 
-        let sort_by_path = GitPanelSettings::get_global(cx).sort_by_path;
+        let settings = GitPanelSettings::get_global(cx);
+        let sort_by_path = settings.sort_by_path;
+        let group_by_staging = settings.group_by_staging;
         let is_tree_view = matches!(self.view_mode, GitPanelViewMode::Tree(_));
         let group_by_status = is_tree_view || !sort_by_path;
 
         let mut changed_entries = Vec::new();
         let mut new_entries = Vec::new();
         let mut conflict_entries = Vec::new();
+        let mut staged_changed_entries = Vec::new();
+        let mut staged_new_entries = Vec::new();
+        let mut staged_conflict_entries = Vec::new();
         let mut single_staged_entry = None;
         let mut staged_count = 0;
         let mut seen_directories = HashSet::default();
@@ -3573,16 +3624,55 @@ impl GitPanel {
                 single_staged_entry = Some(entry.clone());
             }
 
-            if group_by_status && is_conflict {
-                conflict_entries.push(entry);
-            } else if group_by_status && is_new {
-                new_entries.push(entry);
+            if group_by_staging {
+                let to_conflict = group_by_status && is_conflict;
+                let to_new = group_by_status && is_new;
+                let resolved_staging = Self::stage_status_for_entry(&entry, repo);
+
+                match resolved_staging {
+                    StageStatus::Staged => {
+                        if to_conflict {
+                            staged_conflict_entries.push(entry);
+                        } else if to_new {
+                            staged_new_entries.push(entry);
+                        } else {
+                            staged_changed_entries.push(entry);
+                        }
+                    }
+                    StageStatus::Unstaged => {
+                        if to_conflict {
+                            conflict_entries.push(entry);
+                        } else if to_new {
+                            new_entries.push(entry);
+                        } else {
+                            changed_entries.push(entry);
+                        }
+                    }
+                    StageStatus::PartiallyStaged => {
+                        if to_conflict {
+                            staged_conflict_entries.push(entry.clone());
+                            conflict_entries.push(entry);
+                        } else if to_new {
+                            staged_new_entries.push(entry.clone());
+                            new_entries.push(entry);
+                        } else {
+                            staged_changed_entries.push(entry.clone());
+                            changed_entries.push(entry);
+                        }
+                    }
+                }
             } else {
-                changed_entries.push(entry);
+                if group_by_status && is_conflict {
+                    conflict_entries.push(entry);
+                } else if group_by_status && is_new {
+                    new_entries.push(entry);
+                } else {
+                    changed_entries.push(entry);
+                }
             }
         }
 
-        if conflict_entries.is_empty() {
+        if conflict_entries.is_empty() && staged_conflict_entries.is_empty() {
             if staged_count == 1
                 && let Some(entry) = single_staged_entry.as_ref()
             {
@@ -3607,8 +3697,14 @@ impl GitPanel {
             }
         }
 
-        if conflict_entries.is_empty() && changed_entries.len() == 1 {
-            self.single_tracked_entry = changed_entries.first().cloned();
+        if conflict_entries.is_empty()
+            && staged_conflict_entries.is_empty()
+            && changed_entries.len() + staged_changed_entries.len() == 1
+        {
+            self.single_tracked_entry = changed_entries
+                .first()
+                .or(staged_changed_entries.first())
+                .cloned();
         }
 
         let mut push_entry =
@@ -3637,71 +3733,187 @@ impl GitPanel {
                 this.entries.push(entry);
             };
 
-        macro_rules! take_section_entries {
-            () => {
-                [
-                    (Section::Conflict, std::mem::take(&mut conflict_entries)),
-                    (Section::Tracked, std::mem::take(&mut changed_entries)),
-                    (Section::New, std::mem::take(&mut new_entries)),
-                ]
-            };
-        }
+        if group_by_staging {
+            let staged_sections = [
+                (Section::Conflict, std::mem::take(&mut staged_conflict_entries)),
+                (Section::Tracked, std::mem::take(&mut staged_changed_entries)),
+                (Section::New, std::mem::take(&mut staged_new_entries)),
+            ];
+            let unstaged_sections = [
+                (Section::Conflict, std::mem::take(&mut conflict_entries)),
+                (Section::Tracked, std::mem::take(&mut changed_entries)),
+                (Section::New, std::mem::take(&mut new_entries)),
+            ];
 
-        match &mut self.view_mode {
-            GitPanelViewMode::Tree(tree_state) => {
-                tree_state.logical_indices.clear();
-                tree_state.directory_descendants.clear();
+            let staging_groups = [
+                (StagingGroup::Staged, staged_sections),
+                (StagingGroup::Unstaged, unstaged_sections),
+            ];
 
-                // This is just to get around the borrow checker
-                // because push_entry mutably borrows self
-                let mut tree_state = std::mem::take(tree_state);
+            match &mut self.view_mode {
+                GitPanelViewMode::Tree(tree_state) => {
+                    tree_state.logical_indices.clear();
+                    tree_state.directory_descendants.clear();
+                    let mut tree_state = std::mem::take(tree_state);
 
-                for (section, entries) in take_section_entries!() {
-                    if entries.is_empty() {
-                        continue;
-                    }
+                    for (group, sections) in staging_groups {
+                        let has_entries = sections.iter().any(|(_, entries)| !entries.is_empty());
+                        if !has_entries {
+                            continue;
+                        }
 
-                    push_entry(
-                        self,
-                        GitListEntry::Header(GitHeaderEntry { header: section }),
-                        true,
-                        Some(&mut tree_state.logical_indices),
-                    );
+                        let is_collapsed = self.collapsed_staging_groups.contains(&group);
 
-                    for (entry, is_visible) in
-                        tree_state.build_tree_entries(section, entries, &mut seen_directories)
-                    {
                         push_entry(
                             self,
-                            entry,
-                            is_visible,
+                            GitListEntry::StagingGroupHeader(group),
+                            true,
                             Some(&mut tree_state.logical_indices),
                         );
+
+                        for (section, entries) in sections {
+                            if entries.is_empty() {
+                                continue;
+                            }
+
+                            push_entry(
+                                self,
+                                GitListEntry::Header(GitHeaderEntry { header: section }),
+                                !is_collapsed,
+                                Some(&mut tree_state.logical_indices),
+                            );
+
+                            for (entry, is_visible) in tree_state.build_tree_entries(
+                                section,
+                                entries,
+                                &mut seen_directories,
+                            ) {
+                                push_entry(
+                                    self,
+                                    entry,
+                                    is_visible && !is_collapsed,
+                                    Some(&mut tree_state.logical_indices),
+                                );
+                            }
+                        }
+                    }
+
+                    tree_state
+                        .expanded_dirs
+                        .retain(|key, _| seen_directories.contains(key));
+                    self.view_mode = GitPanelViewMode::Tree(tree_state);
+                }
+                GitPanelViewMode::Flat => {
+                    for (group, sections) in staging_groups {
+                        let has_entries = sections.iter().any(|(_, entries)| !entries.is_empty());
+                        if !has_entries {
+                            continue;
+                        }
+
+                        let is_collapsed = self.collapsed_staging_groups.contains(&group);
+
+                        push_entry(
+                            self,
+                            GitListEntry::StagingGroupHeader(group),
+                            true,
+                            None,
+                        );
+
+                        if is_collapsed {
+                            continue;
+                        }
+
+                        for (section, entries) in sections {
+                            if entries.is_empty() {
+                                continue;
+                            }
+
+                            if section != Section::Tracked || !sort_by_path {
+                                push_entry(
+                                    self,
+                                    GitListEntry::Header(GitHeaderEntry { header: section }),
+                                    true,
+                                    None,
+                                );
+                            }
+
+                            for entry in entries {
+                                push_entry(
+                                    self,
+                                    GitListEntry::Status(entry),
+                                    true,
+                                    None,
+                                );
+                            }
+                        }
                     }
                 }
-
-                tree_state
-                    .expanded_dirs
-                    .retain(|key, _| seen_directories.contains(key));
-                self.view_mode = GitPanelViewMode::Tree(tree_state);
             }
-            GitPanelViewMode::Flat => {
-                for (section, entries) in take_section_entries!() {
-                    if entries.is_empty() {
-                        continue;
-                    }
+        } else {
+            macro_rules! take_section_entries {
+                () => {
+                    [
+                        (Section::Conflict, std::mem::take(&mut conflict_entries)),
+                        (Section::Tracked, std::mem::take(&mut changed_entries)),
+                        (Section::New, std::mem::take(&mut new_entries)),
+                    ]
+                };
+            }
 
-                    if section != Section::Tracked || !sort_by_path {
+            match &mut self.view_mode {
+                GitPanelViewMode::Tree(tree_state) => {
+                    tree_state.logical_indices.clear();
+                    tree_state.directory_descendants.clear();
+
+                    let mut tree_state = std::mem::take(tree_state);
+
+                    for (section, entries) in take_section_entries!() {
+                        if entries.is_empty() {
+                            continue;
+                        }
+
                         push_entry(
                             self,
                             GitListEntry::Header(GitHeaderEntry { header: section }),
                             true,
-                            None,
+                            Some(&mut tree_state.logical_indices),
                         );
+
+                        for (entry, is_visible) in
+                            tree_state.build_tree_entries(section, entries, &mut seen_directories)
+                        {
+                            push_entry(
+                                self,
+                                entry,
+                                is_visible,
+                                Some(&mut tree_state.logical_indices),
+                            );
+                        }
                     }
 
-                    for entry in entries {
-                        push_entry(self, GitListEntry::Status(entry), true, None);
+                    tree_state
+                        .expanded_dirs
+                        .retain(|key, _| seen_directories.contains(key));
+                    self.view_mode = GitPanelViewMode::Tree(tree_state);
+                }
+                GitPanelViewMode::Flat => {
+                    for (section, entries) in take_section_entries!() {
+                        if entries.is_empty() {
+                            continue;
+                        }
+
+                        if section != Section::Tracked || !sort_by_path {
+                            push_entry(
+                                self,
+                                GitListEntry::Header(GitHeaderEntry { header: section }),
+                                true,
+                                None,
+                            );
+                        }
+
+                        for entry in entries {
+                            push_entry(self, GitListEntry::Status(entry), true, None);
+                        }
                     }
                 }
             }
@@ -3762,8 +3974,21 @@ impl GitPanel {
         self.new_staged_count = 0;
         self.tracked_staged_count = 0;
         self.entry_count = 0;
+        self.staged_group_count = 0;
+        self.unstaged_group_count = 0;
 
-        for status_entry in self.entries.iter().filter_map(|entry| entry.status_entry()) {
+        let mut current_staging_group: Option<StagingGroup> = None;
+
+        for entry in self.entries.iter() {
+            if let GitListEntry::StagingGroupHeader(group) = entry {
+                current_staging_group = Some(*group);
+                continue;
+            }
+
+            let Some(status_entry) = entry.status_entry() else {
+                continue;
+            };
+
             self.entry_count += 1;
             let is_staging_or_staged = GitPanel::stage_status_for_entry(status_entry, repo)
                 .as_bool()
@@ -3784,6 +4009,12 @@ impl GitPanel {
                 if is_staging_or_staged {
                     self.tracked_staged_count += 1;
                 }
+            }
+
+            match current_staging_group {
+                Some(StagingGroup::Staged) => self.staged_group_count += 1,
+                Some(StagingGroup::Unstaged) => self.unstaged_group_count += 1,
+                None => {}
             }
         }
     }
@@ -3942,7 +4173,7 @@ impl GitPanel {
             GitListEntry::Directory(dir) => {
                 Some(Self::item_width_estimate(0, dir.name.len(), dir.depth))
             }
-            GitListEntry::Header(_) => None,
+            GitListEntry::Header(_) | GitListEntry::StagingGroupHeader(_) => None,
         }
     }
 
@@ -4823,6 +5054,14 @@ impl GitPanel {
                                                 cx,
                                             ));
                                         }
+                                        Some(GitListEntry::StagingGroupHeader(group)) => {
+                                            items.push(this.render_staging_group_header(
+                                                ix,
+                                                *group,
+                                                window,
+                                                cx,
+                                            ));
+                                        }
                                         None => {}
                                     }
                                 }
@@ -4927,6 +5166,53 @@ impl GitPanel {
                     .single_line(),
             )
             .into_any_element()
+    }
+
+    fn render_staging_group_header(
+        &self,
+        ix: usize,
+        group: StagingGroup,
+        _window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let is_collapsed = self.collapsed_staging_groups.contains(&group);
+        let count = match group {
+            StagingGroup::Staged => self.staged_group_count,
+            StagingGroup::Unstaged => self.unstaged_group_count,
+        };
+
+        let id: ElementId = ElementId::Name(format!("staging_group_{}", ix).into());
+
+        h_flex()
+            .id(id)
+            .w_full()
+            .group("staging-group-header")
+            .child(
+                ListHeader::new(group.title())
+                    .toggle(Some(!is_collapsed))
+                    .on_toggle(cx.listener(move |this, _, window, cx| {
+                        this.toggle_staging_group_collapsed(group, window, cx);
+                    }))
+                    .inset(true)
+                    .end_slot(
+                        Label::new(format!("{}", count))
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn toggle_staging_group_collapsed(
+        &mut self,
+        group: StagingGroup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.collapsed_staging_groups.remove(&group) {
+            self.collapsed_staging_groups.insert(group);
+        }
+        self.update_visible_entries(window, cx);
     }
 
     pub fn load_commit_details(
