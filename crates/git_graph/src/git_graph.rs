@@ -48,6 +48,7 @@ use ui::{
 };
 use workspace::{
     Workspace,
+    dock::{DockPosition, PanelEvent},
     item::{Item, ItemEvent, TabTooltipContent},
 };
 
@@ -833,6 +834,83 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+pub struct GitGraphPanel {
+    focus_handle: FocusHandle,
+}
+
+impl GitGraphPanel {
+    pub fn load(
+        workspace: WeakEntity<Workspace>,
+        cx: &mut gpui::AsyncWindowContext,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        cx.spawn(async move |cx| {
+            workspace.update_in(cx, |_workspace, _window, cx| {
+                cx.new(|cx| GitGraphPanel {
+                    focus_handle: cx.focus_handle(),
+                })
+            })
+        })
+    }
+}
+
+impl EventEmitter<PanelEvent> for GitGraphPanel {}
+
+impl Focusable for GitGraphPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for GitGraphPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+impl workspace::Panel for GitGraphPanel {
+    fn persistent_name() -> &'static str {
+        "GitGraphPanel"
+    }
+
+    fn panel_key() -> &'static str {
+        "GitGraphPanel"
+    }
+
+    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+        DockPosition::Left
+    }
+
+    fn position_is_valid(&self, _position: DockPosition) -> bool {
+        false
+    }
+
+    fn set_position(&mut self, _position: DockPosition, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
+        px(0.)
+    }
+
+    fn icon(&self, _window: &Window, _cx: &App) -> Option<ui::IconName> {
+        Some(ui::IconName::GitGraph)
+    }
+
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+        Some("Git Graph")
+    }
+
+    fn toggle_action(&self) -> Box<dyn gpui::Action> {
+        Box::new(git_ui::git_panel::Open)
+    }
+
+    fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
+        false
+    }
+
+    fn activation_priority(&self) -> u32 {
+        4
+    }
 }
 
 fn lane_center_x(bounds: Bounds<Pixels>, lane: f32) -> Pixels {
