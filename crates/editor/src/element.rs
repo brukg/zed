@@ -6309,7 +6309,7 @@ impl EditorElement {
                             .theme()
                             .colors()
                             .editor_background
-                            .blend(background_color.opacity(0.3));
+                            .blend(background_color.opacity(0.1));
 
                         window.paint_quad(quad(
                             hunk_bounds,
